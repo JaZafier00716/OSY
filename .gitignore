@@ -1,1 +1,26 @@
-*secret*
+# Compiled binaries
+transform
+add
+inv
+*.out
+
+# Object and dependency files
+*.o
+*.d
+
+# Debugging and coverage output
+core
+core.*
+*.gcda
+*.gcno
+*.gcov
+
+# Build directories
+build/
+bin/
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+*~
