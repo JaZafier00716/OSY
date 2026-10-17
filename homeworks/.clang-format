@@ -1,0 +1,75 @@
+
+BasedOnStyle: LLVM
+Language: Cpp
+
+# Indentation
+IndentWidth: 4
+AccessModifierOffset: -4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+
+# Line width
+ColumnLimit: 100
+
+# Braces: K&R / attached braces
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+
+# Function declarations and calls: one parameter/argument per line
+BinPackParameters: false
+BinPackArguments: false
+AllowAllParametersOfDeclarationOnNextLine: false
+
+# Operators at the beginning of continuation lines
+BreakBeforeBinaryOperators: All
+BreakBeforeTernaryOperators: true
+
+# Pointers and references: int *ptr, const int *ptr
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Pointer
+
+# Whitespace
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceBeforeParens: ControlStatements
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+
+# Switch statements
+IndentCaseLabels: true
+
+# Prefer explicit, readable multi-line control flow
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+
+# Constructor initializer lists: commas at the ends of lines
+BreakConstructorInitializers: BeforeComma
+PackConstructorInitializers: Never
+
+# Include grouping and sorting
+SortIncludes: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<(algorithm|array|atomic|bit|cassert|cctype|cerrno|cfenv|cfloat|charconv|chrono|cinttypes|climits|clocale|cmath|compare|complex|concepts|condition_variable|coroutine|cstddef|cstdint|cstdio|cstdlib|cstring|ctime|cwchar|cwctype|deque|exception|execution|filesystem|format|forward_list|fstream|functional|future|initializer_list|iomanip|ios|iosfwd|iostream|istream|iterator|limits|list|locale|map|memory|mutex|new|numeric|optional|ostream|queue|random|ranges|ratio|regex|set|shared_mutex|span|sstream|stack|stdexcept|string|string_view|thread|tuple|type_traits|typeindex|typeinfo|unordered_map|unordered_set|utility|variant|vector)>$'
+    Priority: 1
+  - Regex: '^<.*>'
+    Priority: 2
+  - Regex: '^".*"'
+    Priority: 3
+  - Regex: '.*'
+    Priority: 4
