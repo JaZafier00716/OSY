@@ -1,16 +1,20 @@
 // ***************************************************************************
 //
 // Simple line based protocol between socket_cl and socket_srv.
-// Every message is one line terminated by '\n'.
+// Every message is one line terminated by '\n', only FILE header is
+// followed by binary content of file.
 //
 // client -> server:
-//      REQ: <expr>                 evaluate expression
+//      FILE: <size> <name>         header, exactly <size> bytes of file follow
 //      QUIT                        end of connection
 //
 // server -> client:
-//      RES: <expr>=<result>        result of expression (printed by python)
-//      ERR: <what>: <reason>       expression failed, unknown message, line too long
+//      RES: SHA1: <hash> | Typ souboru: <type>
+//                                  result for one file (sha1sum and file)
+//      ERR: <what>: <reason>       processing failed, unknown message, line too long
 //      BYE                         answer to QUIT, then server closes connection
+//
+// Client waits for RES/ERR of one file before it sends next one.
 //
 // ***************************************************************************
 
@@ -19,7 +23,7 @@
 #include <cstring>
 #include <string>
 
-#define PROTO_REQ           "REQ: "
+#define PROTO_FILE          "FILE: "
 #define PROTO_RES           "RES: "
 #define PROTO_ERR           "ERR: "
 #define PROTO_QUIT          "QUIT"
@@ -27,6 +31,7 @@
 
 #define PROTO_MAX_LINE      1024    // longer line is discarded
 #define PROTO_SHOW_LONG     32      // start of too long line shown in error
+#define PROTO_CHUNK         65536   // size of blocks for file transfer
 
 // ***************************************************************************
 // building of messages
@@ -164,6 +169,20 @@ public:
             }
             return LINE_OK;
         }
+    }
+
+    /**
+     * @brief Takes raw (binary) bytes from buffer, e.g. content of file,
+     *        which arrived in the same read as its FILE header.
+     *
+     * @param t_max  at most so many bytes are taken.
+     * @return taken bytes, empty when buffer is empty.
+     */
+    std::string take( size_t t_max )
+    {
+        std::string l_data = m_buf.substr( 0, t_max );
+        m_buf.erase( 0, l_data.size() );
+        return l_data;
     }
 
 private:

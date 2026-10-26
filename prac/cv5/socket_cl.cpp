@@ -6,9 +6,10 @@
 //
 // Example of socket server/client.
 //
-// This program is example of socket client.
-// The mandatory arguments of program is IP address or name of server and
-// a port number.
+// This program is example of socket client. It sends files given as
+// arguments to server, which returns their SHA1 hash and type.
+// The mandatory arguments of program are IP address or name of server,
+// a port number and at least one file.
 //
 // ***************************************************************************
 
@@ -23,17 +24,13 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <ctime>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <string>
+#include <vector>
 
 #include "protocol.h"
 
-#define STR_CLOSE               "close"
-#define STR_QUIT                "quit"
-
-#define POLL_TIMEOUT_MS         2000    // no user input -> auto equation; final value 5000
-#define QUIT_TIMEOUT_MS         5000    // after 'quit' wait so long for server to close connection
-#define AUTO_MAX_NUMBER         9       // auto equations use numbers 0..AUTO_MAX_NUMBER
 
 // ***************************************************************************
 // log messages
@@ -94,9 +91,9 @@ void log_msg( int t_log_level, const char *t_form, ... )
 
 const char g_help[] =
     "\n"
-    "  Socket client example.\n"
+    "  Socket client: sends files to server, which returns their SHA1 and type.\n"
     "\n"
-    "  Use: %s [-h] [-d] ip_or_name port_number\n"
+    "  Use: %s [-h] [-d] ip_or_name port_number file [file ...]\n"
     "\n"
     "    -d  debug mode \n"
     "    -h  this help\n"
@@ -106,98 +103,155 @@ const char g_help[] =
 // ***************************************************************************
 
 /**
- * @brief Generates simple random equation with '+' or '-'.
+ * @brief Writes whole buffer into socket (write can be partial).
  *
- * Both numbers are from 0 to AUTO_MAX_NUMBER.
- *
- * @return equation without '\n', e.g. "7-3".
+ * @param t_fd    socket connected to server.
+ * @param t_data  bytes to send.
+ * @param t_len   number of bytes.
+ * @return true when all bytes were sent, false on error (logged).
  */
-std::string generate_equation()
+bool send_all( int t_fd, const char *t_data, size_t t_len )
 {
-    int l_a = rand() % ( AUTO_MAX_NUMBER + 1 );
-    int l_b = rand() % ( AUTO_MAX_NUMBER + 1 );
-    char l_op = ( rand() % 2 ) ? '+' : '-';
-
-    return std::to_string( l_a ) + l_op + std::to_string( l_b );
-}
-
-// ***************************************************************************
-
-/**
- * @brief Checks, whether user wants to end connection.
- *
- * @param t_line  one line typed by user, without '\n'.
- * @return true for 'quit' or 'close' (case insensitive), otherwise false.
- */
-bool is_end_command( const std::string &t_line )
-{
-    return !strcasecmp( t_line.c_str(), STR_QUIT ) || !strcasecmp( t_line.c_str(), STR_CLOSE );
-}
-
-// ***************************************************************************
-
-/**
- * @brief Sends one protocol message to server; all messages go through it.
- *
- * @param t_sock_server  socket connected to server.
- * @param t_msg          complete message including '\n' (see protocol.h).
- * @return true when message was sent, false on error (logged).
- */
-bool send_to_server( int t_sock_server, const std::string &t_msg )
-{
-    int l_len = write( t_sock_server, t_msg.data(), t_msg.size() );
-    if ( l_len < 0 )
+    while ( t_len > 0 )
     {
-        log_msg( LOG_ERROR, "Unable to send data to server." );
-        return false;
+        ssize_t l_len = write( t_fd, t_data, t_len );
+        if ( l_len < 0 )
+        {
+            if ( errno == EINTR ) continue;
+            log_msg( LOG_ERROR, "Unable to send data to server." );
+            return false;
+        }
+        t_data += l_len;
+        t_len -= l_len;
     }
-
-    log_msg( LOG_DEBUG, "Sent %d bytes to server.", l_len );
     return true;
 }
 
 /**
- * @brief Sends expression for evaluation as message "REQ: <expr>".
+ * @brief Sends one protocol message to server.
  *
  * @param t_sock_server  socket connected to server.
- * @param t_expr         expression without '\n', e.g. "4+5*8".
+ * @param t_msg          complete message including '\n' (see protocol.h).
  * @return true when message was sent, false on error.
  */
-bool send_request( int t_sock_server, const std::string &t_expr )
+bool send_to_server( int t_sock_server, const std::string &t_msg )
 {
-    return send_to_server( t_sock_server, proto_msg( PROTO_REQ, t_expr ) );
+    log_msg( LOG_DEBUG, "Sending: %s", t_msg.substr( 0, t_msg.size() - 1 ).c_str() );
+    return send_all( t_sock_server, t_msg.data(), t_msg.size() );
 }
 
 // ***************************************************************************
 
 /**
- * @brief Generates equation and sends it to server; used when user typed
- *        nothing for POLL_TIMEOUT_MS.
+ * @brief Waits for next complete line from server (blocking).
  *
  * @param t_sock_server  socket connected to server.
- * @return true when equation was sent, false on error.
+ * @param t_lines        buffer of received data, keeps rest for next call.
+ * @param t_line         [out] received line without '\n'.
+ * @return true when line was received, false when server closed connection
+ *         or on error.
  */
-bool send_auto_equation( int t_sock_server )
+bool read_line( int t_sock_server, LineBuffer &t_lines, std::string &t_line )
 {
-    std::string l_eq = generate_equation();
-    log_msg( LOG_INFO, "Timeout, sending auto equation: %s", l_eq.c_str() );
+    while ( 1 )
+    {
+        if ( t_lines.next_line( t_line ) != LINE_NONE ) return true;
 
-    return send_request( t_sock_server, l_eq );
+        char l_buf[ 1024 ];
+        int l_len = read( t_sock_server, l_buf, sizeof( l_buf ) );
+        if ( l_len == 0 )
+        {
+            log_msg( LOG_INFO, "Server closed socket." );
+            return false;
+        }
+        if ( l_len < 0 )
+        {
+            if ( errno == EINTR ) continue;
+            log_msg( LOG_ERROR, "Unable to read data from server." );
+            return false;
+        }
+        log_msg( LOG_DEBUG, "Read %d bytes from server.", l_len );
+        t_lines.feed( l_buf, l_len );
+    }
 }
 
 // ***************************************************************************
 
 /**
- * @brief Socket client: sends equations typed by user (or generated after
- *        timeout) to server and displays its answers.
+ * @brief Sends one file to server as "FILE: <size> <name>" and its content.
  *
- * 'quit' or 'close' sends QUIT, then client waits for BYE (at most
- * QUIT_TIMEOUT_MS) and ends.
+ * @param t_sock_server  socket connected to server.
+ * @param t_name         name of file to send.
+ * @param t_opened       [out] false when file could not be opened/read locally
+ *                       (nothing was sent, connection is still usable).
+ * @return true when whole file was sent, false otherwise.
+ */
+bool send_file( int t_sock_server, const char *t_name, bool &t_opened )
+{
+    t_opened = false;
+
+    int l_fd = open( t_name, O_RDONLY );
+    if ( l_fd < 0 )
+    {
+        log_msg( LOG_ERROR, "Unable to open file '%s'.", t_name );
+        return false;
+    }
+
+    struct stat l_st;
+    if ( fstat( l_fd, &l_st ) < 0 || !S_ISREG( l_st.st_mode ) )
+    {
+        log_msg( LOG_INFO, "'%s' is not regular file, skipped.", t_name );
+        close( l_fd );
+        return false;
+    }
+    t_opened = true;
+
+    std::string l_name = t_name;
+    for ( char &l_c : l_name )
+        if ( l_c == '\n' || l_c == '\r' ) l_c = '?';    // header must stay one line
+
+    unsigned long long l_size = l_st.st_size;
+    log_msg( LOG_INFO, "Sending '%s' (%llu bytes).", t_name, l_size );
+
+    bool l_ok = send_to_server( t_sock_server, proto_msg( PROTO_FILE, std::to_string( l_size ) + " " + l_name ) );
+
+    // send exactly l_size bytes, as announced in header
+    static char l_buf[ PROTO_CHUNK ];
+    unsigned long long l_sent = 0;
+    while ( l_ok && l_sent < l_size )
+    {
+        size_t l_want = sizeof( l_buf );
+        if ( l_size - l_sent < l_want ) l_want = l_size - l_sent;
+
+        int l_len = read( l_fd, l_buf, l_want );
+        if ( l_len <= 0 )
+        {   // file shrank or read error: server would wait forever, connection is broken
+            log_msg( LOG_ERROR, "Unable to read file '%s'.", t_name );
+            l_ok = false;
+            break;
+        }
+        l_ok = send_all( t_sock_server, l_buf, l_len );
+        l_sent += l_len;
+    }
+
+    close( l_fd );
+    log_msg( LOG_DEBUG, "Sent %llu bytes of '%s'.", l_sent, t_name );
+    return l_ok;
+}
+
+// ***************************************************************************
+
+/**
+ * @brief Socket client: sends files given as arguments one after another
+ *        to server and prints their SHA1 and type.
+ *
+ * After every file client waits for server's answer (RES or ERR).
+ * After last file QUIT is sent and client waits for BYE.
  *
  * @param t_argc  number of arguments.
- * @param t_argv  arguments: [-h] [-d] ip_or_name port_number.
- * @return 0 when client ends; EXIT_FAILURE (by exit()) on bad arguments
- *         or connection failure.
+ * @param t_argv  arguments: [-h] [-d] ip_or_name port_number file [file ...].
+ * @return 0 when all files were processed, 1 when some failed;
+ *         EXIT_FAILURE (by exit()) on bad arguments or connection failure.
  */
 int main( int t_argc, char **t_argv )
 {
@@ -207,6 +261,7 @@ int main( int t_argc, char **t_argv )
 
     int l_port = 0;
     char *l_host = nullptr;
+    std::vector<char *> l_files;
 
     // parsing arguments
     for ( int inx = 1; inx < t_argc; inx++ )
@@ -214,6 +269,7 @@ int main( int t_argc, char **t_argv )
         if ( strcmp( t_argv[ inx ], "-d" ) == 0 )
         {
             g_debug = LOG_DEBUG;
+            continue;
         }
 
         if ( strcmp( t_argv[ inx ], "-h" ) == 0 )
@@ -222,16 +278,18 @@ int main( int t_argc, char **t_argv )
             exit( EXIT_SUCCESS );
         }
 
-        if ( *t_argv[ inx ] != '-' )
+        if ( l_host == nullptr )
         {
-            if ( l_host == nullptr  )
-            {
-                l_host = t_argv[ inx ];
-            }
-            else if ( l_port == 0 )
-            {
-                l_port = atoi( t_argv[ inx ] );
-            }
+            l_host = t_argv[ inx ];
+        }
+        else if ( l_port == 0 )
+        {
+            l_port = atoi( t_argv[ inx ] );
+            if ( l_port <= 0 ) break;
+        }
+        else
+        {
+            l_files.push_back( t_argv[ inx ] );     // every other argument is file
         }
     }
 
@@ -242,9 +300,15 @@ int main( int t_argc, char **t_argv )
         exit( EXIT_FAILURE );
     }
 
+    if ( l_files.empty() )
+    {
+        log_msg( LOG_INFO, "No file to send!" );
+        printf( g_help, t_argv[ 0 ] );
+        exit( EXIT_FAILURE );
+    }
+
     log_msg( LOG_INFO, "Connection to '%s':%d.", l_host, l_port );
 
-    srand( time( nullptr ) ^ getpid() );   // different auto equations in every client
     signal( SIGPIPE, SIG_IGN );     // write to closed connection returns error, no kill
 
     addrinfo l_ai_req, *l_ai_ans;
@@ -282,146 +346,64 @@ int main( int t_argc, char **t_argv )
     uint l_lsa = sizeof( l_cl_addr );
     // my IP
     getsockname( l_sock_server, ( sockaddr * ) &l_cl_addr, &l_lsa );
-    log_msg( LOG_INFO, "My IP: '%s'  port: %d",
+    log_msg( LOG_DEBUG, "My IP: '%s'  port: %d",
              inet_ntoa( l_cl_addr.sin_addr ), ntohs( l_cl_addr.sin_port ) );
     // server IP
     getpeername( l_sock_server, ( sockaddr * ) &l_cl_addr, &l_lsa );
-    log_msg( LOG_INFO, "Server IP: '%s'  port: %d",
+    log_msg( LOG_DEBUG, "Server IP: '%s'  port: %d",
              inet_ntoa( l_cl_addr.sin_addr ), ntohs( l_cl_addr.sin_port ) );
 
-    log_msg( LOG_INFO, "Enter 'quit' or 'close' to close application." );
-
-    bool l_quitting = false;    // QUIT sent, waiting for server's BYE
-    bool l_stop = false;        // end of main loop
-    LineBuffer l_stdin_lines;   // user input, line by line
     LineBuffer l_server_lines;  // server messages, line by line
+    bool l_connected = true;    // false after fatal error, nothing more is sent
+    int l_failed = 0;           // files without SHA1
 
-    // list of fd sources
-    pollfd l_read_poll[ 2 ];
-
-    l_read_poll[ 0 ].fd = STDIN_FILENO;
-    l_read_poll[ 0 ].events = POLLIN;
-    l_read_poll[ 1 ].fd = l_sock_server;
-    l_read_poll[ 1 ].events = POLLIN;
-
-    // go!
-    while ( 1 )
+    // go! files one after another
+    for ( char *l_file : l_files )
     {
-        char l_buf[ 128 ];
-
-        // select from fds
-        int l_poll = poll( l_read_poll, 2, l_quitting ? QUIT_TIMEOUT_MS : POLL_TIMEOUT_MS );
-        if ( l_poll < 0 ) break;
-
-        // timeout without any input?
-        if ( l_poll == 0 )
+        bool l_opened;
+        if ( !send_file( l_sock_server, l_file, l_opened ) )
         {
-            if ( l_quitting )
-            {
-                log_msg( LOG_INFO, "Server did not close connection in time." );
-                break;
-            }
-            if ( !send_auto_equation( l_sock_server ) ) break;
-            continue;
+            l_failed++;
+            if ( !l_opened ) continue;  // nothing sent, try next file
+            l_connected = false;
+            break;
         }
 
-        // data on stdin?
-        if ( l_read_poll[ 0 ].revents & ( POLLIN | POLLHUP | POLLERR | POLLNVAL ) )
+        std::string l_line, l_value;
+        if ( !read_line( l_sock_server, l_server_lines, l_line ) )
         {
-            //  read from stdin
-            int l_len = read( STDIN_FILENO, l_buf, sizeof( l_buf ) );
-            if ( l_len == 0 )
-            {
-                log_msg( LOG_DEBUG, "Stdin closed." );
-                break;
-            }
-            if ( l_len < 0 )
-            {
-                log_msg( LOG_ERROR, "Unable to read from stdin." );
-                break;
-            }
-            else
-            {
-                log_msg( LOG_DEBUG, "Read %d bytes from stdin.", l_len );
-            }
-
-            // every line is one expression or command
-            l_stdin_lines.feed( l_buf, l_len );
-            std::string l_line;
-            line_status l_status;
-            while ( !l_stop && !l_quitting && ( l_status = l_stdin_lines.next_line( l_line ) ) != LINE_NONE )
-            {
-                if ( l_status == LINE_TOO_LONG )
-                {
-                    log_msg( LOG_INFO, "Too long line '%s' ignored.", l_line.c_str() );
-                }
-                else if ( l_line.empty() )
-                {
-                    continue;
-                }
-                else if ( is_end_command( l_line ) )
-                {
-                    // server evaluates rest of equations and answers BYE
-                    if ( !send_to_server( l_sock_server, proto_cmd( PROTO_QUIT ) ) ) l_stop = true;
-                    log_msg( LOG_INFO, "Waiting for server to close connection..." );
-                    l_quitting = true;
-                    l_read_poll[ 0 ].fd = -1;   // poll ignores negative fd: no more user input
-                }
-                else if ( !send_request( l_sock_server, l_line ) )
-                {
-                    l_stop = true;
-                }
-            }
-            if ( l_stop ) break;
+            l_failed++;
+            l_connected = false;
+            break;
         }
 
-        // data from server?
-        if ( l_read_poll[ 1 ].revents & ( POLLIN | POLLHUP | POLLERR ) )
+        if ( proto_parse( l_line, PROTO_RES, l_value ) )
+        {   // "SHA1: <hash> | Typ souboru: <type>"
+            printf( "%s: %s\n", l_file, l_value.c_str() );
+        }
+        else
         {
-            // read data from server
-            int l_len = read( l_sock_server, l_buf, sizeof( l_buf ) );
-            if ( l_len == 0 )
+            printf( "%s: %s\n", l_file, l_line.c_str() );
+            l_failed++;
+        }
+    }
+
+    if ( l_connected && send_to_server( l_sock_server, proto_cmd( PROTO_QUIT ) ) )
+    {   // wait for confirmation of end
+        std::string l_line;
+        while ( read_line( l_sock_server, l_server_lines, l_line ) )
+        {
+            if ( l_line == PROTO_BYE )
             {
-                log_msg( l_quitting ? LOG_INFO : LOG_DEBUG, "Server closed socket." );
+                log_msg( LOG_DEBUG, "Connection closed by server." );
                 break;
             }
-            else if ( l_len < 0 )
-            {
-                log_msg( LOG_ERROR, "Unable to read data from server." );
-                break;
-            }
-            else
-            {
-                log_msg( LOG_DEBUG, "Read %d bytes from server.", l_len );
-            }
-
-            // display every complete message on stdout as it is
-            l_server_lines.feed( l_buf, l_len );
-            std::string l_line;
-            line_status l_status;
-            while ( !l_stop && ( l_status = l_server_lines.next_line( l_line ) ) != LINE_NONE )
-            {
-                std::string l_out = l_line + "\n";
-                if ( write( STDOUT_FILENO, l_out.data(), l_out.size() ) < 0 )
-                {
-                    log_msg( LOG_ERROR, "Unable to write to stdout." );
-                    l_stop = true;
-                }
-
-                // server confirmed QUIT, all results are received
-                if ( l_status == LINE_OK && l_line == PROTO_BYE )
-                {
-                    log_msg( LOG_INFO, "Connection closed by server." );
-                    l_stop = true;
-                }
-            }
-            if ( l_stop ) break;
+            printf( "%s\n", l_line.c_str() );
         }
     }
 
     // close socket
     close( l_sock_server );
 
-    return 0;
+    return l_failed ? 1 : 0;
 } // main
-

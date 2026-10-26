@@ -4,7 +4,7 @@
 //
 // Petr Olivka, Dept. of Computer Science, petr.olivka@vsb.cz, 2026
 //
-// Example of socket server.
+// Example of socket server computing SHA1 and type of received files.
 //
 // This program is example of socket server and it allows to connect and serve
 // more clients concurrently. Every client is served by its own child process.
@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <cerrno>
+#include <cctype>
 #include <unistd.h>
 #include <poll.h>
 #include <signal.h>
@@ -34,7 +35,7 @@
 #define STR_QUIT    "quit"
 #define STR_STAT    "stat"
 
-#define BATCH_SIZE  3       // python is run when at least so many expressions wait
+#define TMP_TEMPLATE    "/tmp/socket_srv_XXXXXX"   // received files are stored here
 
 // ***************************************************************************
 // log messages
@@ -146,40 +147,19 @@ void install_sigchld_handler()
 // ***************************************************************************
 
 /**
- * @brief Builds python code, which evaluates one expression.
+ * @brief Runs command in new process, waits for its end and returns its stdout.
  *
- * Code prints protocol message "RES: <expr>=<result>", or on runtime error
- * (e.g. 1/0) "ERR: <expr>: <reason>" (same format as proto_err()) and
- * description of exception to stderr (server terminal). Runtime error
- * does not stop following statements of batch.
+ * Command's stdout is redirected to pipe, which is read by parent until EOF.
+ * Its stderr stays in server terminal. Client socket is closed in child,
+ * so command never writes to client directly.
  *
- * @param t_expr  arithmetic expression, e.g. "4+5*8"; it is not escaped.
- * @return Python statement (try/except block) terminated by '\n'.
+ * @param t_args        program and its arguments, t_args[ 0 ] is searched in PATH.
+ * @param t_close_fd    descriptor closed in child (client socket), -1 for none.
+ * @param t_out         [out] complete stdout of command.
+ * @return true when command finished with exit code 0, false when pipe,
+ *         fork or exec failed or command ended with error.
  */
-std::string build_python_statement( const std::string &t_expr )
-{
-    return "try:\n"
-           "    print(\"" PROTO_RES + t_expr + "=\", " + t_expr + ", sep=\"\")\n"
-           "except Exception as err:\n"
-           "    print(\"" PROTO_ERR + t_expr + ": \" + str(err))\n"
-           "    print(\"" + t_expr + ":\", repr(err), file=__import__(\"sys\").stderr)\n";
-}
-
-// ***************************************************************************
-
-/**
- * @brief Runs python3 in new process and waits for its end.
- *
- * Python's stdin is redirected to pipe, which is fed with t_code,
- * its stdout is redirected to t_out_fd, so output goes directly to client.
- * All unused pipe ends and descriptors are closed in both processes.
- *
- * @param t_code    python code to execute.
- * @param t_out_fd  descriptor for python's stdout (client socket).
- * @return true when python finished with exit code 0, false when pipe,
- *         fork or exec failed or python ended with error (e.g. syntax error).
- */
-bool run_python( const std::string &t_code, int t_out_fd )
+bool run_command( const std::vector<std::string> &t_args, int t_close_fd, std::string &t_out )
 {
     int l_pipe[ 2 ];
     if ( pipe( l_pipe ) < 0 )
@@ -193,45 +173,51 @@ bool run_python( const std::string &t_code, int t_out_fd )
     pid_t l_pid = fork();
     if ( l_pid < 0 )
     {
-        log_msg( LOG_ERROR, "Unable to fork process for python." );
+        log_msg( LOG_ERROR, "Unable to fork process for %s.", t_args[ 0 ].c_str() );
         close( l_pipe[ 0 ] );
         close( l_pipe[ 1 ] );
         return false;
     }
 
     if ( l_pid == 0 )
-    { // child: becomes python3
-        if ( dup2( l_pipe[ 0 ], STDIN_FILENO ) < 0 || dup2( t_out_fd, STDOUT_FILENO ) < 0 )
+    { // child: becomes command
+        if ( dup2( l_pipe[ 1 ], STDOUT_FILENO ) < 0 )
         {
-            log_msg( LOG_ERROR, "Unable to redirect python stdin/stdout." );
+            log_msg( LOG_ERROR, "Unable to redirect stdout of %s.", t_args[ 0 ].c_str() );
             _exit( EXIT_FAILURE );
         }
         close( l_pipe[ 0 ] );
-        close( l_pipe[ 1 ] );   // otherwise python never gets EOF on stdin
-        if ( t_out_fd != STDOUT_FILENO ) close( t_out_fd );
+        close( l_pipe[ 1 ] );
+        if ( t_close_fd >= 0 ) close( t_close_fd );
 
-        execlp( "python3", "python3", nullptr );
-        log_msg( LOG_ERROR, "Unable to execute python3." );
+        std::vector<char *> l_argv;
+        for ( const std::string &l_arg : t_args )
+            l_argv.push_back( const_cast<char *>( l_arg.c_str() ) );
+        l_argv.push_back( nullptr );
+
+        execvp( l_argv[ 0 ], l_argv.data() );
+        log_msg( LOG_ERROR, "Unable to execute %s.", t_args[ 0 ].c_str() );
         _exit( EXIT_FAILURE );
     }
 
-    // parent: send code to python and wait for result
+    // parent: read whole output of command
+    close( l_pipe[ 1 ] );   // otherwise read never gets EOF
+    t_out.clear();
+    char l_buf[ 1024 ];
+    int l_len;
+    while ( ( l_len = read( l_pipe[ 0 ], l_buf, sizeof( l_buf ) ) ) > 0 )
+        t_out.append( l_buf, l_len );
+    if ( l_len < 0 ) log_msg( LOG_ERROR, "Unable to read output of %s.", t_args[ 0 ].c_str() );
     close( l_pipe[ 0 ] );
-    int l_len = write( l_pipe[ 1 ], t_code.data(), t_code.size() );
-    if ( l_len != ( int ) t_code.size() )
-    {
-        log_msg( LOG_ERROR, "Unable to write code to python." );
-    }
-    close( l_pipe[ 1 ] );   // EOF for python, it starts to execute code
 
     int l_status = 0;
     if ( waitpid( l_pid, &l_status, 0 ) < 0 )
     {
-        log_msg( LOG_ERROR, "Unable to wait for python." );
+        log_msg( LOG_ERROR, "Unable to wait for %s.", t_args[ 0 ].c_str() );
         return false;
     }
 
-    return WIFEXITED( l_status ) && WEXITSTATUS( l_status ) == 0;
+    return l_len == 0 && WIFEXITED( l_status ) && WEXITSTATUS( l_status ) == 0;
 }
 
 // ***************************************************************************
@@ -239,7 +225,6 @@ bool run_python( const std::string &t_code, int t_out_fd )
 /**
  * @brief Sends one protocol message to client.
  *
- * Used for ERR and BYE messages, results (RES) are sent by python itself.
  * Failure is only logged.
  *
  * @param t_sock_client  socket of client.
@@ -256,53 +241,155 @@ void send_to_client( int t_sock_client, const std::string &t_msg )
 // ***************************************************************************
 
 /**
- * @brief Evaluates all expressions by one run of python, results go to client.
+ * @brief Computes SHA1 (sha1sum) and type (file) of received file
+ *        and sends "RES: SHA1: <hash> | Typ souboru: <type>" to client.
  *
- * When python fails for whole batch (e.g. syntax error in one expression),
- * client receives "ERR: <expr>: batch failed" for every expression.
+ * When one of commands fails, client receives "ERR: <name>: <reason>".
  *
- * @param t_sock_client  socket of client, python writes results into it.
- * @param t_exprs        expressions of batch.
+ * @param t_sock_client  socket of client.
+ * @param t_path         temporary file with received content.
+ * @param t_name         name of file given by client (for messages only).
  */
-void evaluate_batch( int t_sock_client, const std::vector<std::string> &t_exprs )
+void process_file( int t_sock_client, const std::string &t_path, const std::string &t_name )
 {
-    std::string l_code;
-    for ( const std::string &l_expr : t_exprs )
-        l_code += build_python_statement( l_expr );
+    std::string l_out;
 
-    log_msg( LOG_INFO, "[%d] Evaluating batch of %d expressions.", getpid(), ( int ) t_exprs.size() );
-    if ( !run_python( l_code, t_sock_client ) )
+    // sha1sum prints "<hash>  <path>"
+    if ( !run_command( { "sha1sum", t_path }, t_sock_client, l_out ) )
     {
-        log_msg( LOG_INFO, "[%d] Python failed for batch.", getpid() );
-        for ( const std::string &l_expr : t_exprs )
-            send_to_client( t_sock_client, proto_err( l_expr, "batch failed" ) );
+        send_to_client( t_sock_client, proto_err( t_name, "sha1sum failed" ) );
+        return;
     }
+    std::string l_hash = l_out.substr( 0, l_out.find_first_of( " \t\n" ) );
+
+    // file -b prints only description of type, without file name
+    if ( !run_command( { "file", "-b", t_path }, t_sock_client, l_out ) )
+    {
+        send_to_client( t_sock_client, proto_err( t_name, "file failed" ) );
+        return;
+    }
+    while ( !l_out.empty() && ( l_out.back() == '\n' || l_out.back() == '\r' ) ) l_out.pop_back();
+    for ( char &l_c : l_out )
+        if ( l_c == '\n' || l_c == '\r' ) l_c = ' ';  // answer must stay one line
+
+    log_msg( LOG_INFO, "[%d] '%s': SHA1 %s, %s.", getpid(), t_name.c_str(), l_hash.c_str(), l_out.c_str() );
+    send_to_client( t_sock_client, proto_msg( PROTO_RES, "SHA1: " + l_hash + " | Typ souboru: " + l_out ) );
 }
 
 // ***************************************************************************
-// statistics: children report processed equations to parent through pipe
+
+/**
+ * @brief Temporary file being received from client.
+ *
+ * File is closed and removed automatically, also when client
+ * disconnects in the middle of transfer.
+ */
+struct recv_file
+{
+    int m_fd = -1;                      // temporary file, -1 when no transfer runs
+    std::string m_path;                 // its name
+    std::string m_name;                 // name of file given by client
+    unsigned long long m_remaining = 0; // bytes still expected
+
+    /**
+     * @brief Creates temporary file for new transfer.
+     *
+     * @return true on success, false when file can not be created.
+     */
+    bool start( const std::string &t_name, unsigned long long t_size )
+    {
+        char l_path[] = TMP_TEMPLATE;
+        m_fd = mkstemp( l_path );
+        if ( m_fd < 0 ) return false;
+        m_path = l_path;
+        m_name = t_name;
+        m_remaining = t_size;
+        return true;
+    }
+
+    /**
+     * @brief Ends transfer: closes and removes temporary file.
+     */
+    void finish()
+    {
+        if ( m_fd >= 0 ) close( m_fd );
+        if ( !m_path.empty() ) unlink( m_path.c_str() );
+        m_fd = -1;
+        m_path.clear();
+        m_remaining = 0;
+    }
+
+    bool active() const { return m_fd >= 0; }
+
+    ~recv_file() { finish(); }
+};
+
+/**
+ * @brief Writes whole buffer into file (write can be partial).
+ *
+ * @return true when all bytes were written.
+ */
+bool write_all( int t_fd, const char *t_data, size_t t_len )
+{
+    while ( t_len > 0 )
+    {
+        ssize_t l_len = write( t_fd, t_data, t_len );
+        if ( l_len < 0 )
+        {
+            if ( errno == EINTR ) continue;
+            return false;
+        }
+        t_data += l_len;
+        t_len -= l_len;
+    }
+    return true;
+}
+
+/**
+ * @brief Parses value of FILE header "<size> <name>".
+ *
+ * @param t_value  value of message after "FILE: ".
+ * @param t_size   [out] size of file.
+ * @param t_name   [out] name of file, may contain spaces.
+ * @return true when header is valid.
+ */
+bool parse_file_header( const std::string &t_value, unsigned long long &t_size, std::string &t_name )
+{
+    if ( t_value.empty() || !isdigit( ( unsigned char ) t_value[ 0 ] ) ) return false;
+
+    char *l_end = nullptr;
+    errno = 0;
+    t_size = strtoull( t_value.c_str(), &l_end, 10 );
+    if ( errno || *l_end != ' ' || l_end[ 1 ] == '\0' ) return false;
+
+    t_name = l_end + 1;
+    return true;
+}
+
+// ***************************************************************************
+// statistics: children report processed files to parent through pipe
 
 struct stat_msg
 {
     pid_t m_pid;            // child serving client
-    int m_count;            // equations processed since last message
+    int m_count;            // files processed since last message
     bool m_finished;        // client disconnected, child exits
 };
 
 struct stat_table
 {
-    std::map<pid_t, int> m_clients;     // connected clients: pid -> equations
-    int m_total = 0;                    // equations of all clients
+    std::map<pid_t, int> m_clients;     // connected clients: pid -> files
+    int m_total = 0;                    // files of all clients
 };
 
 /**
- * @brief Child: reports processed equations to parent through statistics pipe.
+ * @brief Child: reports processed files to parent through statistics pipe.
  *
  * Message is smaller than PIPE_BUF, so write is atomic and messages
  * from more children never mix. Failure is only logged.
  *
  * @param t_stat_fd   write end of statistics pipe.
- * @param t_count     number of equations processed since last report.
+ * @param t_count     number of files processed since last report.
  * @param t_finished  true when client disconnected and child exits.
  */
 void stat_report( int t_stat_fd, int t_count, bool t_finished )
@@ -328,12 +415,12 @@ void stat_report( int t_stat_fd, int t_count, bool t_finished )
  */
 void stat_print( const stat_table &t_table )
 {
-    log_msg( LOG_INFO, "STAT: %d client(s) connected, all clients processed %d equations.",
+    log_msg( LOG_INFO, "STAT: %d client(s) connected, all clients processed %d files.",
              ( int ) t_table.m_clients.size(), t_table.m_total );
 
     for ( const auto &l_client : t_table.m_clients )
     {
-        log_msg( LOG_INFO, "STAT:   client [%d]: %d equations", l_client.first, l_client.second );
+        log_msg( LOG_INFO, "STAT:   client [%d]: %d files", l_client.first, l_client.second );
     }
 }
 
@@ -341,7 +428,7 @@ void stat_print( const stat_table &t_table )
  * @brief Parent: receives one message from statistics pipe and updates table.
  *
  * Every update is logged. Finished client is removed from table,
- * its equations stay in total.
+ * its files stay in total.
  *
  * @param t_stat_fd  read end of statistics pipe.
  * @param t_table    statistics to update.
@@ -361,13 +448,13 @@ void stat_receive( int t_stat_fd, stat_table &t_table )
 
     if ( l_msg.m_finished )
     {
-        log_msg( LOG_INFO, "STAT: client [%d] finished, %d equations processed (all clients: %d).",
+        log_msg( LOG_INFO, "STAT: client [%d] finished, %d files processed (all clients: %d).",
                  l_msg.m_pid, l_count, t_table.m_total );
         t_table.m_clients.erase( l_msg.m_pid );
     }
     else
     {
-        log_msg( LOG_INFO, "STAT: client [%d] processed %d equations (all clients: %d).",
+        log_msg( LOG_INFO, "STAT: client [%d] processed %d files (all clients: %d).",
                  l_msg.m_pid, l_count, t_table.m_total );
     }
 }
@@ -377,10 +464,11 @@ void stat_receive( int t_stat_fd, stat_table &t_table )
 /**
  * @brief Communication with one client, runs in child process.
  *
- * Reads protocol messages line by line. REQ expressions are buffered and
- * evaluated by python when at least BATCH_SIZE of them wait. QUIT evaluates
- * rest of buffer, sends BYE and ends. Unknown message or too long line
- * is answered by ERR. Processed equations are reported to parent.
+ * Reads protocol messages line by line. FILE header switches to receiving
+ * of binary content, which is stored into temporary file. When whole file
+ * is received, its SHA1 and type are sent to client and line mode continues.
+ * QUIT sends BYE and ends. Unknown message, bad header or too long line
+ * is answered by ERR. Processed files are reported to parent.
  *
  * @param t_sock_client  socket of client.
  * @param t_stat_fd      write end of statistics pipe.
@@ -395,13 +483,12 @@ void handle_client( int t_sock_client, int t_stat_fd )
     l_read_poll[ 0 ].fd = t_sock_client;
     l_read_poll[ 0 ].events = POLLIN;
 
-    std::vector<std::string> l_pending;     // expressions waiting for evaluation
     LineBuffer l_lines;                     // joins messages split into more reads
+    recv_file l_file;                       // file being received
+    static char l_buf[ PROTO_CHUNK ];
 
     while ( 1 )
     { // communication
-        char l_buf[ 256 ];
-
         // select from fds
         int l_poll = poll( l_read_poll, 1, -1 );
 
@@ -418,7 +505,11 @@ void handle_client( int t_sock_client, int t_stat_fd )
             int l_len = read( t_sock_client, l_buf, sizeof( l_buf ) );
             if ( l_len == 0 )
             {
-                log_msg( LOG_DEBUG, "[%d] Client closed socket!", getpid() );
+                if ( l_file.active() )
+                    log_msg( LOG_INFO, "[%d] Client closed socket during transfer of '%s'.",
+                             getpid(), l_file.m_name.c_str() );
+                else
+                    log_msg( LOG_DEBUG, "[%d] Client closed socket!", getpid() );
                 return;
             }
             else if ( l_len < 0 )
@@ -431,12 +522,38 @@ void handle_client( int t_sock_client, int t_stat_fd )
 
             bool l_end = false;     // client sent QUIT
 
-            // every complete line is one message
             l_lines.feed( l_buf, l_len );
-            std::string l_line, l_expr;
-            line_status l_status;
-            while ( !l_end && ( l_status = l_lines.next_line( l_line ) ) != LINE_NONE )
+            while ( !l_end )
             {
+                if ( l_file.active() )
+                {   // content of file
+                    std::string l_data = l_lines.take( l_file.m_remaining );
+                    if ( l_data.empty() ) break;    // wait for more data
+
+                    if ( !write_all( l_file.m_fd, l_data.data(), l_data.size() ) )
+                    {
+                        log_msg( LOG_ERROR, "[%d] Unable to write temporary file.", getpid() );
+                        send_to_client( t_sock_client, proto_err( l_file.m_name, "unable to store file" ) );
+                        return;     // rest of file can not be skipped reliably
+                    }
+                    l_file.m_remaining -= l_data.size();
+
+                    if ( l_file.m_remaining == 0 )
+                    {   // whole file received
+                        close( l_file.m_fd );
+                        l_file.m_fd = -1;
+                        process_file( t_sock_client, l_file.m_path, l_file.m_name );
+                        l_file.finish();
+                        stat_report( t_stat_fd, 1, false );
+                    }
+                    continue;
+                }
+
+                // every complete line is one message
+                std::string l_line, l_value;
+                line_status l_status = l_lines.next_line( l_line );
+                if ( l_status == LINE_NONE ) break;
+
                 if ( l_status == LINE_TOO_LONG )
                 {
                     log_msg( LOG_INFO, "[%d] Too long line '%s'.", getpid(), l_line.c_str() );
@@ -451,27 +568,39 @@ void handle_client( int t_sock_client, int t_stat_fd )
                     log_msg( LOG_INFO, "[%d] Client sent " PROTO_QUIT " request to close connection.", getpid() );
                     l_end = true;
                 }
-                else if ( proto_parse( l_line, PROTO_REQ, l_expr ) && !l_expr.empty() )
+                else if ( proto_parse( l_line, PROTO_FILE, l_value ) )
                 {
-                    // expression waits in buffer for batch
-                    l_pending.push_back( l_expr );
-                    log_msg( LOG_INFO, "[%d] Buffered '%s' (%d/%d).", getpid(),
-                             l_expr.c_str(), ( int ) l_pending.size(), BATCH_SIZE );
+                    unsigned long long l_size;
+                    std::string l_name;
+                    if ( !parse_file_header( l_value, l_size, l_name ) )
+                    {   // size is unknown, data can not be skipped
+                        log_msg( LOG_INFO, "[%d] Bad file header '%s'.", getpid(), l_line.c_str() );
+                        send_to_client( t_sock_client, proto_err( l_line, "bad file header" ) );
+                        return;
+                    }
+                    if ( !l_file.start( l_name, l_size ) )
+                    {
+                        log_msg( LOG_ERROR, "[%d] Unable to create temporary file.", getpid() );
+                        send_to_client( t_sock_client, proto_err( l_name, "unable to store file" ) );
+                        return;
+                    }
+                    log_msg( LOG_INFO, "[%d] Receiving '%s' (%llu bytes) into %s.", getpid(),
+                             l_name.c_str(), l_size, l_file.m_path.c_str() );
+
+                    if ( l_size == 0 )
+                    {   // empty file, no data follow
+                        close( l_file.m_fd );
+                        l_file.m_fd = -1;
+                        process_file( t_sock_client, l_file.m_path, l_file.m_name );
+                        l_file.finish();
+                        stat_report( t_stat_fd, 1, false );
+                    }
                 }
                 else
                 {
                     log_msg( LOG_INFO, "[%d] Unknown message '%s'.", getpid(), l_line.c_str() );
                     send_to_client( t_sock_client, proto_err( l_line, "unknown message" ) );
                 }
-            }
-
-            // enough expressions, or last ones before end?
-            // python sends results to client
-            if ( l_pending.size() >= BATCH_SIZE || ( l_end && !l_pending.empty() ) )
-            {
-                evaluate_batch( t_sock_client, l_pending );
-                stat_report( t_stat_fd, l_pending.size(), false );
-                l_pending.clear();
             }
 
             if ( l_end )
@@ -518,7 +647,7 @@ pid_t start_client_process( int t_sock_listen, int t_sock_client, const int t_st
         if ( getppid() != l_parent ) exit( EXIT_FAILURE );  // parent died before prctl
 
         signal( SIGCHLD, SIG_DFL );     // child will wait for its own children
-        signal( SIGPIPE, SIG_IGN );     // failed write to python returns error, no kill
+        signal( SIGPIPE, SIG_IGN );     // failed write to client returns error, no kill
         close( t_sock_listen );
         close( t_stat_pipe[ 0 ] );      // child only writes statistics
 
@@ -625,7 +754,7 @@ int main( int t_argc, char **t_argv )
     install_sigchld_handler();
 
     // pipe for statistics from children; parent keeps write end open too,
-    // so read end never gets EOF; O_CLOEXEC: python3 does not inherit it
+    // so read end never gets EOF; O_CLOEXEC: sha1sum and file do not inherit it
     int l_stat_pipe[ 2 ];
     if ( pipe2( l_stat_pipe, O_CLOEXEC ) < 0 )
     {
