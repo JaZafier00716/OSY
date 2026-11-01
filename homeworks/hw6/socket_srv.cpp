@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -41,6 +42,8 @@
 
 // debug flag
 int g_debug = LOG_INFO;
+
+#define PLAYFIELD_SIZE 8
 
 void log_msg(int t_log_level, const char* t_form, ...) {
     const char* out_fmt[] = {"ERR: (%d-%s) %s\n", "INF: %s\n", "DEB: %s\n"};
@@ -79,6 +82,7 @@ struct client_t {
     int sock;            // socket number of the client
     char nick[NICK_LEN]; // nick of the client (empty string if not entered yet)
     bool used;           // true if this slot is used, false if free
+    size_t score = 0;
 };
 
 std::vector<client_t> g_clients; // shared list of clients
@@ -129,6 +133,172 @@ void strip(char* t_str) {
                || t_str[l_len - 1] == '\t')) {
         t_str[--l_len] = '\0';
     }
+}
+
+// ***************************************************************************
+// Playfield and card definitions
+
+size_t g_player_turn_id = 0; // ID of the player whose turn it is
+
+enum card_state_t { CARD_SHOWN, CARD_HIDDEN, CARD_GUESSED }; // state of one card
+
+struct card_t {
+    int image_id;
+    card_state_t state = CARD_HIDDEN;
+};
+
+card_t playfield[PLAYFIELD_SIZE][PLAYFIELD_SIZE]
+    = {{{0}, {0}, {1}, {1}, {2}, {2}, {3}, {3}},
+       {{4}, {4}, {5}, {5}, {6}, {6}, {7}, {7}},
+       {{8}, {8}, {9}, {9}, {10}, {10}, {11}, {11}},
+       {{12}, {12}, {13}, {13}, {14}, {14}, {15}, {15}},
+       {{16}, {16}, {17}, {17}, {18}, {18}, {19}, {19}},
+       {{20}, {20}, {21}, {21}, {22}, {22}, {23}, {23}},
+       {{24}, {24}, {25}, {25}, {26}, {26}, {27}, {27}},
+       {{28}, {28}, {29}, {29}, {30}, {30}, {31}, {31}}};
+
+std::string images[32] = {"🍎", "🍌", "🍇", "🍒", "🍓", "🍉", "🍋", "🍑", "🥝", "🍍", "🥕",
+                          "🌽", "🍄", "🌵", "🌻", "🌈", "🐶", "🐱", "🐸", "🐵", "🐧", "🐙",
+                          "🦊", "🐢", "🔥", "💎", "🎈", "🎲", "🎸", "🚀", "🚗", "🔔"};
+
+// std::string images[32] = {"AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK",
+//                           "LL", "MM", "NN", "OO", "PP", "QQ", "RR", "SS", "TT", "UU", "VV",
+//                           "WW", "XX", "YY", "ZZ", "**", "@@", "$$", "&&", "##", "!!"};
+
+void print_playfield() {
+    std::string out;
+    out.reserve(PLAYFIELD_SIZE * PLAYFIELD_SIZE * 4 + 64); // reserve enough space for the output
+
+    char buf[64];
+
+    for (int i = 0; i < PLAYFIELD_SIZE + 1; i++) {
+        for (int j = 0; j < PLAYFIELD_SIZE + 1; j++) {
+            if (i == 0 && j == 0) {
+                out += "   "; // top-left corner
+            } else if (i == 0) {
+                snprintf(buf, sizeof(buf), "%2c ", 'a' + j - 1); // column headers
+                out += buf;
+            } else if (j == 0) {
+                snprintf(buf, sizeof(buf), "%2d ", i - 1); // row headers
+                out += buf;
+            } else {
+                const auto& card = playfield[i - 1][j - 1];
+                if (card.state == CARD_GUESSED) {
+                    // out += "   "; // empty space for guessed cards
+                    out += images[card.image_id] + " "; // show the image for guessed cards
+                } else if (card.state == CARD_SHOWN) {
+                    out += images[card.image_id] + " "; // show the image for shown cards
+                } else {
+                    out += "❓ "; // hidden card
+                }
+            }
+        }
+        out += "\n";
+    }
+    broadcast(out.c_str(), -1); // broadcast to all clients
+
+    std::string turn_msg
+        = "It is player " + std::string(g_clients[g_player_turn_id].nick) + "'s turn.\n";
+
+    broadcast(turn_msg.c_str(), -1);
+}
+
+bool is_game_over() {
+    for (int i = 0; i < PLAYFIELD_SIZE; i++) {
+        for (int j = 0; j < PLAYFIELD_SIZE; j++) {
+            if (playfield[i][j].state != CARD_GUESSED) {
+                return false; // found a card that is not guessed
+            }
+        }
+    }
+    return true; // all cards are guessed
+}
+
+void hide_shown_cards() {
+    for (int i = 0; i < PLAYFIELD_SIZE; i++) {
+        for (int j = 0; j < PLAYFIELD_SIZE; j++) {
+            if (playfield[i][j].state == CARD_SHOWN) {
+                playfield[i][j].state = CARD_HIDDEN;
+            }
+        }
+    }
+}
+
+bool match_cards(int row1, int col1, int row2, int col2) {
+    if (row1 < 0 || row1 >= PLAYFIELD_SIZE || col1 < 0 || col1 >= PLAYFIELD_SIZE || row2 < 0
+        || row2 >= PLAYFIELD_SIZE || col2 < 0 || col2 >= PLAYFIELD_SIZE) {
+        return false; // invalid coordinates
+    }
+    auto& card1 = playfield[row1][col1];
+    auto& card2 = playfield[row2][col2];
+    if (card1.image_id == card2.image_id) {
+        // match found
+        card1.state = CARD_GUESSED;
+        card2.state = CARD_GUESSED;
+        return true;
+    } else {
+        // no match, hide the cards again
+        card1.state = CARD_SHOWN;
+        card2.state = CARD_SHOWN;
+        return false;
+    }
+}
+
+bool is_my_turn(size_t player_id) {
+    return g_player_turn_id == player_id;
+}
+
+// Returns 0 if the turn was successful, 1 if no match was found, and -1 for invalid input.
+int play_turn(int t_sock, size_t player_id, const char* input) {
+    // Implement the logic for a player's turn based on the input
+    // For example, parse the input to select a card and update the playfield
+    // This is a placeholder implementation
+
+    char* col1 = strtok(const_cast<char*>(input), "-");
+    if (col1 == nullptr) {
+        send_str(t_sock, "Invalid input format. Use 'row-col' format.\n");
+        return -1;
+    }
+    char* line1 = strtok(nullptr, "-");
+    if (line1 == nullptr) {
+        send_str(t_sock, "Invalid input format. Use 'row-col' format.\n");
+        return -1;
+    }
+    char* col2 = strtok(nullptr, "-");
+    if (col2 == nullptr) {
+        send_str(t_sock, "Invalid input format. Use 'row-col' format.\n");
+        return -1;
+    }
+    char* line2 = strtok(nullptr, "-");
+    if (line2 == nullptr) {
+        send_str(t_sock, "Invalid input format. Use 'row-col' format.\n");
+        return -1;
+    }
+    int row1_idx = atoi(line1);
+    int col1_idx = col1[0] - 'a';
+    int row2_idx = atoi(line2);
+    int col2_idx = col2[0] - 'a';
+
+    if (row1_idx < 0 || row1_idx >= PLAYFIELD_SIZE || col1_idx < 0 || col1_idx >= PLAYFIELD_SIZE
+        || row2_idx < 0 || row2_idx >= PLAYFIELD_SIZE || col2_idx < 0
+        || col2_idx >= PLAYFIELD_SIZE) {
+        send_str(t_sock, "Invalid card coordinates. Please try again.\n");
+        return -1;
+    }
+    if (row1_idx == row2_idx && col1_idx == col2_idx) {
+        send_str(t_sock, "You cannot select the same card twice. Please try again.\n");
+        return -1;
+    }
+
+    if (playfield[row1_idx][col1_idx].state == CARD_GUESSED
+        || playfield[row2_idx][col2_idx].state == CARD_GUESSED) {
+        send_str(
+            t_sock,
+            "One or both of the selected cards have already been guessed. Please try again.\n");
+        return -1;
+    }
+
+    return !match_cards(row1_idx, col1_idx, row2_idx, col2_idx);
 }
 
 // ***************************************************************************
@@ -188,6 +358,8 @@ void chat_loop(int t_sock, size_t t_inx) {
     snprintf(l_msg, sizeof(l_msg), "* %s joined the chat\n", l_nick);
     broadcast(l_msg, l_sock);
 
+    bool await_back = false;
+
     while (1) {
         int l_len = read(l_sock, l_line, sizeof(l_line) - 1);
         if (l_len <= 0) {
@@ -201,6 +373,62 @@ void chat_loop(int t_sock, size_t t_inx) {
             break;
         }
         strip(l_line);
+
+        print_playfield(); // Print the current playfield state after each message
+        if (is_my_turn(t_inx)) {
+            // Handle the player's turn logic here
+            // For example, you can prompt the player to select a card
+            // and update the playfield accordingly.
+            if (await_back) {
+                if (strncasecmp(l_line, "back", 4) == 0) {
+                    await_back = false;
+                    g_player_turn_id = (g_player_turn_id + 1) % g_clients.size();
+                    hide_shown_cards();
+                    print_playfield();
+                    continue;
+                } else {
+                    send_str(
+                        l_sock,
+                        "You must enter 'back' to hide cards and allow next player to play.\n");
+                    continue;
+                }
+            }
+
+            auto ret = play_turn(
+                l_sock, t_inx, l_line); // Implement this function to handle the player's turn
+            if (ret == -1) {
+                send_str(l_sock, "Invalid input. Please try again.\n");
+                continue;
+            } else if (ret == 1) {
+                await_back = true;
+                print_playfield();
+                send_str(
+                    l_sock,
+                    "No match found. Enter 'back' to hide cards and allow next player to play.\n");
+                continue;
+            } else {
+                g_clients[t_inx].score++;
+                send_str(l_sock,
+                         ("Match found! Your score is now " + std::to_string(g_clients[t_inx].score)
+                          + ".\n")
+                             .c_str());
+                await_back = false; // matched, next player's turn
+                g_player_turn_id = (g_player_turn_id + 1) % g_clients.size();
+                print_playfield();
+            }
+        }
+
+        if (is_game_over()) {
+            std::string winner_msg = "Game over! Final scores:\n";
+            for (const auto& client : g_clients) {
+                if (client.used) {
+                    winner_msg
+                        += std::string(client.nick) + ": " + std::to_string(client.score) + "\n";
+                }
+            }
+            broadcast(winner_msg.c_str(), -1);
+            break;
+        }
 
         snprintf(l_msg, sizeof(l_msg), "%s: %s\n", l_nick, l_line);
         send_str(STDOUT_FILENO, l_msg);
@@ -222,6 +450,7 @@ void* client_thread(void* t_arg) {
 
     // 2) ask for nick, 3) chat (chat only if the nick was entered)
     if (ask_nick(l_sock, l_inx) == 0) {
+        print_playfield(); // Print the playfield when a new player joins
         chat_loop(l_sock, l_inx);
     }
 
