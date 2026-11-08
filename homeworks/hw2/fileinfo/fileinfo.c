@@ -48,6 +48,7 @@ int print_file_info(const char *filename, bool symlink) {
     perror("An error has occurred while trying to get file information");
     return rval;
   }
+  
   printf("Name: %s\n", filename);
   printf("Type: ");
   print_file_type(file_stat.st_mode);
